@@ -14,6 +14,79 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::borrow::Borrow;
+use std::cmp::PartialEq;
+use std::collections::{HashMap, HashSet};
+use std::convert::From;
+use std::convert::TryFrom;
+use std::error;
+use std::fmt;
+use std::hash::Hash;
+use std::hash::Hasher;
+use std::io;
+use std::io::{Read, Write};
+use std::io::prelude::*;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
+use std::ops::Deref;
+use std::str::FromStr;
+
+use curve25519_dalek::digest::Digest;
+use rand::RngCore;
+use rand::thread_rng;
+use regex::Regex;
+use rusqlite;
+use serde::{Deserialize, Serialize};
+use serde::de::Error as de_Error;
+use serde::ser::Error as ser_Error;
+use serde_json;
+use sha2::Sha512Trunc256;
+use url;
+
+use burnchains::{BURNCHAIN_HEADER_HASH_ENCODED_SIZE, PrivateKey, PublicKey};
+use burnchains::BurnchainHeaderHash;
+use burnchains::Txid;
+use chainstate::burn::BlockHeaderHash;
+use chainstate::burn::ConsensusHash;
+use chainstate::burn::db::sortdb::PoxId;
+use chainstate::stacks::{
+    Error as chain_error, StacksAddress, StacksBlock, StacksBlockId, StacksMicroblock,
+    StacksPublicKey, StacksTransaction,
+};
+use chainstate::stacks::db::blocks::MemPoolRejection;
+use chainstate::stacks::Error as chainstate_error;
+use chainstate::stacks::index::Error as marf_error;
+use codec::{Error as codec_error, write_next, read_next};
+use core::mempool::*;
+use core::POX_REWARD_CYCLE_LENGTH;
+use net::atlas::{Attachment, AttachmentInstance};
+use util::db::DBConn;
+use util::db::Error as db_error;
+use util::get_epoch_time_secs;
+use util::hash::{hex_bytes, to_hex};
+use util::hash::DOUBLE_SHA256_ENCODED_SIZE;
+use util::hash::Hash160;
+use util::hash::HASH160_ENCODED_SIZE;
+use util::log;
+use util::secp256k1::{MESSAGE_SIGNATURE_ENCODED_SIZE, Secp256k1PrivateKey};
+use util::secp256k1::MessageSignature;
+use util::secp256k1::Secp256k1PublicKey;
+use util::strings::UrlString;
+use vm::{
+    analysis::contract_interface_builder::ContractInterface, ClarityName, ContractName,
+    types::PrincipalData, Value,
+};
+use vm::clarity::Error as clarity_error;
+use vm::types::TraitIdentifier;
+
+use crate::codec::StacksMessageCodec;
+use crate::util::hash::Sha256Sum;
+
+use self::dns::*;
+pub use self::http::StacksHttp;
+
 pub mod asn;
 pub mod atlas;
 pub mod chat;
@@ -31,91 +104,6 @@ pub mod prune;
 pub mod relay;
 pub mod rpc;
 pub mod server;
-
-use std::borrow::Borrow;
-use std::cmp::PartialEq;
-use std::collections::{HashMap, HashSet};
-use std::convert::From;
-use std::convert::TryFrom;
-use std::error;
-use std::fmt;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::io;
-use std::io::prelude::*;
-use std::io::{Read, Write};
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
-use std::net::SocketAddr;
-use std::ops::Deref;
-use std::str::FromStr;
-
-use rusqlite;
-use url;
-
-use rand::thread_rng;
-use rand::RngCore;
-
-use serde::{Deserialize, Serialize};
-use serde_json;
-
-use regex::Regex;
-
-use core::mempool::*;
-
-use burnchains::BurnchainHeaderHash;
-use burnchains::Txid;
-use burnchains::BURNCHAIN_HEADER_HASH_ENCODED_SIZE;
-
-use chainstate::burn::BlockHeaderHash;
-use chainstate::burn::ConsensusHash;
-
-use chainstate::burn::db::sortdb::PoxId;
-
-use chainstate::stacks::db::blocks::MemPoolRejection;
-use chainstate::stacks::{
-    Error as chain_error, StacksAddress, StacksBlock, StacksBlockId, StacksMicroblock,
-    StacksPublicKey, StacksTransaction,
-};
-
-use chainstate::stacks::Error as chainstate_error;
-
-use vm::{
-    analysis::contract_interface_builder::ContractInterface, types::PrincipalData, ClarityName,
-    ContractName, Value,
-};
-
-use util::hash::Hash160;
-use util::hash::DOUBLE_SHA256_ENCODED_SIZE;
-use util::hash::HASH160_ENCODED_SIZE;
-
-use util::db::DBConn;
-use util::db::Error as db_error;
-
-use util::log;
-
-use util::secp256k1::MessageSignature;
-use util::secp256k1::Secp256k1PublicKey;
-use util::secp256k1::MESSAGE_SIGNATURE_ENCODED_SIZE;
-use util::strings::UrlString;
-
-use util::get_epoch_time_secs;
-use util::hash::{hex_bytes, to_hex};
-
-use serde::de::Error as de_Error;
-use serde::ser::Error as ser_Error;
-
-use chainstate::stacks::index::Error as marf_error;
-use vm::clarity::Error as clarity_error;
-
-use crate::util::hash::Sha256Sum;
-
-use self::dns::*;
-
-use net::atlas::{Attachment, AttachmentInstance};
-
-use core::POX_REWARD_CYCLE_LENGTH;
 
 #[derive(Debug)]
 pub enum Error {
@@ -221,6 +209,20 @@ pub enum Error {
     ConnectionCycle,
     /// Requested data not found
     NotFoundError,
+}
+
+impl From<codec_error> for Error {
+    fn from(e: codec_error) -> Self {
+        match e {
+            codec_error::SerializeError(s) => Error::SerializeError(s),
+            codec_error::ReadError(e) => Error::ReadError(e),
+            codec_error::DeserializeError(s) => Error::DeserializeError(s),
+            codec_error::WriteError(e) => Error::WriteError(e),
+            codec_error::UnderflowError(s) => Error::UnderflowError(s),
+            codec_error::OverflowError(s) => Error::OverflowError(s),
+            codec_error::ArrayTooLong => Error::ArrayTooLong,
+        }
+    }
 }
 
 /// Enum for passing data for ClientErrors
@@ -410,29 +412,6 @@ impl PartialEq for Error {
         let s1 = format!("{:?}", self);
         let s2 = format!("{:?}", other);
         s1 == s2
-    }
-}
-
-/// Helper trait for various primitive types that make up Stacks messages
-pub trait StacksMessageCodec {
-    /// serialize implementors _should never_ error unless there is an underlying
-    ///   failure in writing to the `fd`
-    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), Error>
-    where
-        Self: Sized;
-    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<Self, Error>
-    where
-        Self: Sized;
-    /// Convenience for serialization to a vec.
-    ///  this function unwraps any underlying serialization error
-    fn serialize_to_vec(&self) -> Vec<u8>
-    where
-        Self: Sized,
-    {
-        let mut bytes = vec![];
-        self.consensus_serialize(&mut bytes)
-            .expect("BUG: serialization to buffer failed.");
-        bytes
     }
 }
 
@@ -635,9 +614,9 @@ impl HttpContentType {
 }
 
 impl FromStr for HttpContentType {
-    type Err = Error;
+    type Err = codec_error;
 
-    fn from_str(header: &str) -> Result<HttpContentType, Error> {
+    fn from_str(header: &str) -> Result<HttpContentType, codec_error> {
         let s = header.to_string().to_lowercase();
         if s == "application/octet-stream" {
             Ok(HttpContentType::Bytes)
@@ -646,7 +625,7 @@ impl FromStr for HttpContentType {
         } else if s == "application/json" {
             Ok(HttpContentType::JSON)
         } else {
-            Err(Error::DeserializeError(
+            Err(codec_error::DeserializeError(
                 "Unsupported HTTP content type".to_string(),
             ))
         }
@@ -708,6 +687,170 @@ pub const PREAMBLE_ENCODED_SIZE: u32 = 4
     + 4
     + MESSAGE_SIGNATURE_ENCODED_SIZE
     + 4;
+
+impl Preamble {
+    /// Make an empty preamble with the given version and fork-set identifier, and payload length.
+    pub fn new(
+        peer_version: u32,
+        network_id: u32,
+        block_height: u64,
+        burn_block_hash: &BurnchainHeaderHash,
+        stable_block_height: u64,
+        stable_burn_block_hash: &BurnchainHeaderHash,
+        payload_len: u32,
+    ) -> Preamble {
+        Preamble {
+            peer_version: peer_version,
+            network_id: network_id,
+            seq: 0,
+            burn_block_height: block_height,
+            burn_block_hash: burn_block_hash.clone(),
+            burn_stable_block_height: stable_block_height,
+            burn_stable_block_hash: stable_burn_block_hash.clone(),
+            additional_data: 0,
+            signature: MessageSignature::empty(),
+            payload_len: payload_len,
+        }
+    }
+
+    /// Given the serialized message type and bits, sign the resulting message and store the
+    /// signature.  message_bits includes the relayers, payload type, and payload.
+    pub fn sign(
+        &mut self,
+        message_bits: &[u8],
+        privkey: &Secp256k1PrivateKey,
+    ) -> Result<(), Error> {
+        let mut digest_bits = [0u8; 32];
+        let mut sha2 = Sha512Trunc256::new();
+
+        // serialize the premable with a blank signature
+        let old_signature = self.signature.clone();
+        self.signature = MessageSignature::empty();
+
+        let mut preamble_bits = vec![];
+        self.consensus_serialize(&mut preamble_bits)?;
+        self.signature = old_signature;
+
+        sha2.input(&preamble_bits[..]);
+        sha2.input(message_bits);
+
+        digest_bits.copy_from_slice(sha2.result().as_slice());
+
+        let sig = privkey
+            .sign(&digest_bits)
+            .map_err(|se| Error::SigningError(se.to_string()))?;
+
+        self.signature = sig;
+        Ok(())
+    }
+
+    /// Given the serialized message type and bits, verify the signature.
+    /// message_bits includes the relayers, payload type, and payload
+    pub fn verify(
+        &mut self,
+        message_bits: &[u8],
+        pubkey: &Secp256k1PublicKey,
+    ) -> Result<(), Error> {
+        let mut digest_bits = [0u8; 32];
+        let mut sha2 = Sha512Trunc256::new();
+
+        // serialize the preamble with a blank signature
+        let sig_bits = self.signature.clone();
+        self.signature = MessageSignature::empty();
+
+        let mut preamble_bits = vec![];
+        self.consensus_serialize(&mut preamble_bits)?;
+        self.signature = sig_bits;
+
+        sha2.input(&preamble_bits[..]);
+        sha2.input(message_bits);
+
+        digest_bits.copy_from_slice(sha2.result().as_slice());
+
+        let res = pubkey
+            .verify(&digest_bits, &self.signature)
+            .map_err(|_ve| Error::VerifyingError("Failed to verify signature".to_string()))?;
+
+        if res {
+            Ok(())
+        } else {
+            Err(Error::VerifyingError(
+                "Invalid message signature".to_string(),
+            ))
+        }
+    }
+}
+
+impl StacksMessageCodec for Preamble {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
+        write_next(fd, &self.peer_version)?;
+        write_next(fd, &self.network_id)?;
+        write_next(fd, &self.seq)?;
+        write_next(fd, &self.burn_block_height)?;
+        write_next(fd, &self.burn_block_hash)?;
+        write_next(fd, &self.burn_stable_block_height)?;
+        write_next(fd, &self.burn_stable_block_hash)?;
+        write_next(fd, &self.additional_data)?;
+        write_next(fd, &self.signature)?;
+        write_next(fd, &self.payload_len)?;
+        Ok(())
+    }
+
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<Preamble, codec_error> {
+        let peer_version: u32 = read_next(fd)?;
+        let network_id: u32 = read_next(fd)?;
+        let seq: u32 = read_next(fd)?;
+        let burn_block_height: u64 = read_next(fd)?;
+        let burn_block_hash: BurnchainHeaderHash = read_next(fd)?;
+        let burn_stable_block_height: u64 = read_next(fd)?;
+        let burn_stable_block_hash: BurnchainHeaderHash = read_next(fd)?;
+        let additional_data: u32 = read_next(fd)?;
+        let signature: MessageSignature = read_next(fd)?;
+        let payload_len: u32 = read_next(fd)?;
+
+        // minimum is 5 bytes -- a zero-length vector (4 bytes of 0) plus a type identifier (1 byte)
+        if payload_len < 5 {
+            test_debug!("Payload len is too small: {}", payload_len);
+            return Err(codec_error::DeserializeError(format!(
+                "Payload len is too small: {}",
+                payload_len
+            )));
+        }
+
+        if payload_len >= MAX_MESSAGE_LEN {
+            test_debug!("Payload len is too big: {}", payload_len);
+            return Err(codec_error::DeserializeError(format!(
+                "Payload len is too big: {}",
+                payload_len
+            )));
+        }
+
+        if burn_block_height <= burn_stable_block_height {
+            test_debug!(
+                "burn block height {} <= burn stable block height {}",
+                burn_block_height,
+                burn_stable_block_height
+            );
+            return Err(codec_error::DeserializeError(format!(
+                "Burn block height {} <= burn stable block height {}",
+                burn_block_height, burn_stable_block_height
+            )));
+        }
+
+        Ok(Preamble {
+            peer_version,
+            network_id,
+            seq,
+            burn_block_height,
+            burn_block_hash,
+            burn_stable_block_height,
+            burn_stable_block_hash,
+            additional_data,
+            signature,
+            payload_len,
+        })
+    }
+}
 
 /// Request for a block inventory or a list of blocks.
 /// Aligned to a PoX reward cycle.
@@ -1537,12 +1680,6 @@ pub trait ProtocolFamily {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StacksP2P {}
 
-pub use self::http::StacksHttp;
-use vm::types::TraitIdentifier;
-
-// an array in our protocol can't exceed this many items
-pub const ARRAY_MAX_LEN: u32 = u32::max_value();
-
 // maximum number of neighbors in a NeighborsData
 pub const MAX_NEIGHBORS_DATA_LEN: u32 = 128;
 
@@ -1572,26 +1709,6 @@ pub const GETPOXINV_MAX_BITLEN: u64 = 8;
 // message.
 pub const BLOCKS_PUSHED_MAX: u32 = 32;
 
-macro_rules! impl_byte_array_message_codec {
-    ($thing:ident, $len:expr) => {
-        impl ::net::StacksMessageCodec for $thing {
-            fn consensus_serialize<W: std::io::Write>(
-                &self,
-                fd: &mut W,
-            ) -> Result<(), ::net::Error> {
-                fd.write_all(self.as_bytes())
-                    .map_err(::net::Error::WriteError)
-            }
-            fn consensus_deserialize<R: std::io::Read>(fd: &mut R) -> Result<$thing, ::net::Error> {
-                let mut buf = [0u8; ($len as usize)];
-                fd.read_exact(&mut buf).map_err(::net::Error::ReadError)?;
-                let ret = $thing::from_bytes(&buf).expect("BUG: buffer is not the right size");
-                Ok(ret)
-            }
-        }
-    };
-}
-impl_byte_array_message_codec!(ConsensusHash, 20);
 impl_byte_array_message_codec!(Hash160, 20);
 impl_byte_array_message_codec!(BurnchainHeaderHash, 32);
 impl_byte_array_message_codec!(BlockHeaderHash, 32);
@@ -1599,8 +1716,6 @@ impl_byte_array_message_codec!(StacksBlockId, 32);
 impl_byte_array_message_codec!(MessageSignature, 65);
 impl_byte_array_message_codec!(PeerAddress, 16);
 impl_byte_array_message_codec!(StacksPublicKeyBuffer, 33);
-
-impl_byte_array_serde!(ConsensusHash);
 
 /// neighbor identifier
 #[derive(Clone, Eq, PartialOrd, Ord)]
@@ -1888,58 +2003,8 @@ pub trait Requestable: std::fmt::Display {
 
 #[cfg(test)]
 pub mod test {
-    use super::*;
-    use net::asn::*;
-    use net::atlas::*;
-    use net::chat::*;
-    use net::codec::*;
-    use net::connection::*;
-    use net::db::*;
-    use net::neighbors::*;
-    use net::p2p::*;
-    use net::poll::*;
-    use net::relay::*;
-    use net::rpc::RPCHandlerArgs;
-    use net::Error as net_error;
-
-    use core::NETWORK_P2P_PORT;
-
-    use chainstate::burn::db::sortdb;
-    use chainstate::burn::db::sortdb::*;
-    use chainstate::burn::operations::*;
-    use chainstate::burn::*;
-    use chainstate::stacks::boot::*;
-    use chainstate::stacks::db::*;
-    use chainstate::stacks::miner::test::*;
-    use chainstate::stacks::miner::*;
-    use chainstate::stacks::*;
-    use chainstate::*;
-
-    use chainstate::stacks::db::StacksChainState;
-
-    use chainstate::stacks::index::TrieHash;
-
-    use chainstate::coordinator::tests::*;
-    use chainstate::coordinator::*;
-
-    use burnchains::burnchain::*;
-    use burnchains::db::BurnchainDB;
-    use burnchains::test::*;
-    use burnchains::*;
-
-    use burnchains::bitcoin::address::*;
-    use burnchains::bitcoin::keys::*;
-    use burnchains::bitcoin::*;
-
-    use util::get_epoch_time_secs;
-    use util::hash::*;
-    use util::secp256k1::*;
-    use util::uint::*;
-
-    use address::*;
-    use vm::costs::ExecutionCost;
-
     use std::collections::HashMap;
+    use std::fs;
     use std::io;
     use std::io::Cursor;
     use std::io::ErrorKind;
@@ -1951,18 +2016,58 @@ pub mod test {
     use std::sync::mpsc::sync_channel;
     use std::thread;
 
-    use std::fs;
-
+    use mio;
     use rand;
     use rand::RngCore;
 
-    use mio;
-
+    use address::*;
+    use burnchains::*;
+    use burnchains::bitcoin::*;
+    use burnchains::bitcoin::address::*;
+    use burnchains::bitcoin::keys::*;
+    use burnchains::burnchain::*;
+    use burnchains::db::BurnchainDB;
+    use burnchains::test::*;
+    use chainstate::*;
+    use chainstate::burn::*;
+    use chainstate::burn::db::sortdb;
+    use chainstate::burn::db::sortdb::*;
+    use chainstate::burn::operations::*;
+    use chainstate::coordinator::*;
+    use chainstate::coordinator::tests::*;
+    use chainstate::stacks::*;
+    use chainstate::stacks::boot::*;
+    use chainstate::stacks::db::*;
+    use chainstate::stacks::db::StacksChainState;
+    use chainstate::stacks::index::TrieHash;
+    use chainstate::stacks::miner::*;
+    use chainstate::stacks::miner::test::*;
+    use core::NETWORK_P2P_PORT;
+    use net::asn::*;
+    use net::atlas::*;
+    use net::chat::*;
+    use net::codec::*;
+    use net::connection::*;
+    use net::db::*;
+    use net::Error as net_error;
+    use net::neighbors::*;
+    use net::p2p::*;
+    use net::poll::*;
+    use net::relay::*;
+    use net::rpc::RPCHandlerArgs;
+    use util::get_epoch_time_secs;
+    use util::hash::*;
+    use util::secp256k1::*;
     use util::strings::*;
+    use util::uint::*;
     use util::vrf::*;
-
+    use vm::costs::ExecutionCost;
     use vm::database::STXBalance;
     use vm::types::*;
+
+    use crate::codec::StacksMessageCodec;
+
+    use super::*;
 
     impl StacksMessageCodec for BlockstackOperationType {
         fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), net_error> {

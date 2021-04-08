@@ -15,7 +15,7 @@ use stacks::chainstate::stacks::{
     C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
 use stacks::core::CHAIN_ID_TESTNET;
-use stacks::net::StacksMessageCodec;
+use stacks::codec::StacksMessageCodec;
 use stacks::util::get_epoch_time_secs;
 use stacks::util::hash::hex_bytes;
 use stacks::util::strings::StacksString;

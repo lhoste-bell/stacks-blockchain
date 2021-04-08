@@ -58,6 +58,8 @@ use util::retry::BoundReader;
 
 use chainstate::burn::db::sortdb::*;
 
+use codec::Error as codec_error;
+
 use net::BlocksInvData;
 use net::Error as net_error;
 use net::MAX_MESSAGE_LEN;
@@ -128,8 +130,8 @@ pub struct StagingUserBurnSupport {
 
 #[derive(Debug)]
 pub enum MemPoolRejection {
-    SerializationFailure(net_error),
-    DeserializationFailure(net_error),
+    SerializationFailure(codec_error),
+    DeserializationFailure(codec_error),
     FailedToValidate(Error),
     FeeTooLow(u64, u64),
     BadNonces(TransactionNonceMismatch),
@@ -665,7 +667,7 @@ impl StacksChainState {
             })?;
 
         let mut bound_reader = BoundReader::from_reader(&mut fd, MAX_MESSAGE_LEN as u64);
-        let inst = T::consensus_deserialize(&mut bound_reader).map_err(Error::NetError)?;
+        let inst = T::consensus_deserialize(&mut bound_reader).map_err(Error::CodecError)?;
         Ok(inst)
     }
 
@@ -728,7 +730,7 @@ impl StacksChainState {
             &block_path
         );
         StacksChainState::atomic_file_store(&block_path, true, |ref mut fd| {
-            block.consensus_serialize(fd).map_err(Error::NetError)
+            block.consensus_serialize(fd).map_err(Error::CodecError)
         })
     }
 
@@ -1688,7 +1690,7 @@ impl StacksChainState {
         let mut microblock_bytes = vec![];
         microblock
             .consensus_serialize(&mut microblock_bytes)
-            .map_err(Error::NetError)?;
+            .map_err(Error::CodecError)?;
 
         let index_block_hash = StacksBlockHeader::make_index_block_hash(
             parent_consensus_hash,
@@ -4701,7 +4703,7 @@ impl StacksChainState {
     fn extract_stacks_block(next_staging_block: &StagingBlock) -> Result<StacksBlock, Error> {
         let block = {
             StacksBlock::consensus_deserialize(&mut &next_staging_block.block_data[..])
-                .map_err(Error::NetError)?
+                .map_err(Error::CodecError)?
         };
 
         let block_hash = block.block_hash();

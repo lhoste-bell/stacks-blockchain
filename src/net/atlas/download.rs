@@ -593,7 +593,7 @@ impl BatchedDNSLookupsState {
                         Ok(url) => url,
                         Err(e) => {
                             warn!("Atlas: Unsupported URL {:?}, {}", url_str, e);
-                            state.errors.insert(url_str, e);
+                            state.errors.insert(url_str, e.into());
                             continue;
                         }
                     };

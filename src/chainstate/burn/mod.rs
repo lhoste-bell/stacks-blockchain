@@ -60,6 +60,8 @@ pub struct ConsensusHash(pub [u8; 20]);
 impl_array_newtype!(ConsensusHash, u8, 20);
 impl_array_hexstring_fmt!(ConsensusHash);
 impl_byte_array_newtype!(ConsensusHash, u8, 20);
+impl_byte_array_message_codec!(ConsensusHash, 20);
+impl_byte_array_serde!(ConsensusHash);
 pub const CONSENSUS_HASH_ENCODED_SIZE: u32 = 20;
 
 pub struct BlockHeaderHash(pub [u8; 32]);

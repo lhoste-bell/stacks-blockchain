@@ -24,7 +24,7 @@ use vm::types::QualifiedContractIdentifier;
 
 use burnchains::Txid;
 use chainstate::stacks::StacksBlockId;
-use net::StacksMessageCodec;
+use crate::codec::StacksMessageCodec;
 
 use super::{AtlasConfig, Attachment, AttachmentInstance};
 
